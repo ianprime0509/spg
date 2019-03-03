@@ -9,5 +9,8 @@ spg: $(OBJS)
 clean:
 	rm -f $(OBJS) spg
 
-.c.o:
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+config.h:
+	cp config.def.h config.h
+
+spg.o: spg.c config.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o spg.o spg.c
