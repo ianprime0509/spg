@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,9 @@
 
 #define LEN(x) (sizeof(x) / sizeof(*(x)))
 #define USED(x) ((void)(x))
+
+#define RUNE_EOF -1
+#define RUNE_INVALID 0xFFFD
 
 typedef union Arg Arg;
 typedef struct Key Key;
@@ -50,15 +54,18 @@ static int quit(Arg a);
 
 #include "config.h"
 
+typedef int_fast32_t Rune;
 typedef struct Buffer Buffer;
 typedef struct Window Window;
+typedef struct Input Input;
 
 static SCREEN *scrn;
 static Window *win;
+static Input *input;
 
 struct Buffer {
-	char **lines;
-	size_t len, cap, width, maxwidth;
+	Rune **lines;
+	size_t len, cap, width, linecap;
 };
 
 struct Window {
@@ -66,25 +73,43 @@ struct Window {
 	size_t rows, row;
 };
 
+struct Input {
+	FILE *file;
+	char buf[4];
+	size_t buflen;
+	Rune unread;
+};
+
 static void die(int status, const char *fmt, ...);
 static void *xmalloc(size_t sz);
 static void *xrealloc(void *mem, size_t sz);
 
+static size_t printwidth(Rune r);
+static size_t sprintrune(char *s, Rune r);
+static size_t utfdecode(const char *s, size_t len, Rune *r);
+static size_t utfencode(char *s, Rune r);
+
 static Buffer *bufnew(void);
 static void buffree(Buffer *buf);
 static void bufgrow(Buffer *buf);
-static char *bufnewline(Buffer *buf);
+static Rune *bufnewline(Buffer *buf);
 static void bufsetwidth(Buffer *buf, size_t width);
 
 static Window *winnew(void);
 static void winfree(Window *win);
-static void winfill(Window *win);
-static int wingetline(Window *win);
-static void winresize(Window *win, size_t rows, size_t cols);
-static void winscrollbot(Window *win);
-static void winscrolldown(Window *win, size_t lines);
+static void winfill(Window *win, Input *in);
+static int wingetline(Window *win, Input *in);
+static void winresize(Window *win, size_t rows, size_t cols, Input *in);
+static void winscrollbot(Window *win, Input *in);
+static void winscrolldown(Window *win, size_t lines, Input *in);
 static void winscrolltop(Window *win);
 static void winscrollup(Window *win, size_t lines);
+
+static Input *inputnew(FILE *file);
+static void inputfree(Input *in);
+static int inputatend(Input *in);
+static Rune inputgetrune(Input *in);
+static void inputungetrune(Input *in, Rune r);
 
 static void uiinit(void);
 static void uiteardown(void);
@@ -95,7 +120,7 @@ static void uiresize(void);
 static int
 pagedown(Arg a)
 {
-	winscrolldown(win, a.lf > 0 ? a.lf * win->rows : 1);
+	winscrolldown(win, a.lf > 0 ? a.lf * win->rows : 1, input);
 	uirefresh();
 	return 0;
 }
@@ -112,7 +137,7 @@ static int
 scrollbot(Arg a)
 {
 	USED(a);
-	winscrollbot(win);
+	winscrollbot(win, input);
 	uirefresh();
 	return 0;
 }
@@ -120,7 +145,7 @@ scrollbot(Arg a)
 static int
 scrolldown(Arg a)
 {
-	winscrolldown(win, a.zu);
+	winscrolldown(win, a.zu, input);
 	uirefresh();
 	return 0;
 }
@@ -186,13 +211,110 @@ xrealloc(void *mem, size_t sz)
 	return newmem;
 }
 
+static size_t printwidth(Rune r)
+{
+	/* TODO: implement some logic for characters that take up two cells */
+	if (r < 0x20 || r == 0x7F) {
+		return 2;
+	}
+	return 1;
+}
+
+static size_t sprintrune(char *s, Rune r)
+{
+	if (r < 0x20 || r == 0x7F) {
+		s[0] = '^';
+		s[1] = r ^ 0x40;
+		return 2;
+	}
+	return utfencode(s, r);
+}
+
+static size_t utfdecode(const char *s, size_t len, Rune *r)
+{
+	Rune got;
+	size_t bytes, i;
+
+	got = 0;
+	bytes = 0;
+	if (len < 1)
+		goto done;
+
+	if ((s[0] & 0x80) == 0) {
+		got = s[0];
+		bytes = 1;
+		goto done;
+	}
+
+	if ((s[0] & 0xF8) == 0xF0) {
+		got = s[0] & 0x7;
+		bytes = 4;
+	} else if ((s[0] & 0xF0) == 0xE0) {
+		got = s[0] & 0xF;
+		bytes = 3;
+	} else if ((s[0] & 0xE0) == 0xC0) {
+		got = s[0] & 0x1F;
+		bytes = 2;
+	}
+	if (bytes > len) {
+		got = RUNE_INVALID;
+		bytes = 1;
+		goto done;
+	}
+
+	bytes = len;
+	for (i = 1; i < len; i++)
+		if ((s[i] & 0xC0) == 0x80) {
+			got = (got << 6) | (s[i] & 0x3F);
+		} else {
+			got = RUNE_INVALID;
+			bytes = 1;
+			goto done;
+		}
+
+	if (got >= 0xD800 && got <= 0xDFFF) {
+		got = RUNE_INVALID;
+		bytes = 1;
+	}
+
+done:
+	if (r)
+		*r = got;
+	return bytes;
+}
+
+static size_t utfencode(char *s, Rune r)
+{
+	if (r < 0 || r > 0x10FFFF) {
+		return 0;
+	} else if (r <= 0x7F) {
+		s[0] = r;
+		return 1;
+	} else if (r <= 0x7FF) {
+		s[0] = 0xC0 | ((r >> 6) & 0x1F);
+		s[1] = 0x80 | (r & 0x3F);
+		return 2;
+	} else if (r <= 0xFFFF) {
+		s[0] = 0xC0 | ((r >> 12) & 0x1F);
+		s[1] = 0x80 | ((r >> 6) & 0x3F);
+		s[2] = 0x80 | (r & 0x3F);
+		return 3;
+	} else {
+		s[0] = 0xC0 | ((r >> 18) & 0x1F);
+		s[1] = 0x80 | ((r >> 12) & 0x3F);
+		s[2] = 0x80 | ((r >> 6) & 0x3F);
+		s[3] = 0x80 | (r & 0x3F);
+		return 4;
+	}
+}
+
 static Buffer *
 bufnew(void)
 {
 	Buffer *buf;
 
 	buf = xmalloc(sizeof(*buf));
-	buf->len = buf->width = buf->maxwidth = 0;
+	buf->len = buf->width = buf->linecap = 0;
 	buf->cap = 128;
 	buf->lines = xmalloc(buf->cap * sizeof(*buf->lines));
 	return buf;
@@ -216,15 +338,17 @@ bufgrow(Buffer *buf)
 	buf->lines = xrealloc(buf->lines, buf->cap * sizeof(*buf->lines));
 }
 
-static char *
+static Rune *
 bufnewline(Buffer *buf)
 {
-	char *line;
+	Rune *line;
+	size_t i;
 
 	if (buf->len == buf->cap)
 		bufgrow(buf);
-	line = buf->lines[buf->len++] = malloc(buf->maxwidth);
-	memset(line, ' ', buf->maxwidth);
+	line = buf->lines[buf->len++] = xmalloc(buf->linecap * sizeof(**buf->lines));
+	for (i = 0; i < buf->linecap; i++)
+		line[i] = ' ';
 	return line;
 }
 
@@ -233,13 +357,13 @@ bufsetwidth(Buffer *buf, size_t width)
 {
 	size_t i, j;
 
-	if (width > buf->maxwidth) {
+	if (width > buf->linecap) {
 		for (i = 0; i < buf->len; i++) {
 			buf->lines[i] = xrealloc(buf->lines[i], width);
-			for (j = buf->maxwidth; j < width; j++)
+			for (j = buf->linecap; j < width; j++)
 				buf->lines[i][j] = ' ';
 		}
-		buf->maxwidth = width;
+		buf->linecap = width;
 	}
 	buf->width = width;
 }
@@ -263,13 +387,13 @@ winfree(Window *win)
 }
 
 static void
-winfill(Window *win)
+winfill(Window *win, Input *in)
 {
 	size_t newrows;
 
 	newrows = 0;
 	while (win->buf->len < win->rows)
-		if (wingetline(win))
+		if (wingetline(win, in))
 			break;
 		else
 			newrows++;
@@ -278,46 +402,50 @@ winfill(Window *win)
 }
 
 static int
-wingetline(Window *win)
+wingetline(Window *win, Input *in)
 {
-	char *line;
+	Rune *line;
 	size_t i;
-	int c;
+	Rune r;
 
-	if (feof(stdin) || ferror(stdin))
+	if (inputatend(in))
 		return 1;
 
 	line = bufnewline(win->buf);
-	for (i = 0; i < win->buf->width; i++)
-		if ((c = getchar()) == EOF || c == '\n')
+	for (i = 0; i < win->buf->linecap; i++)
+		if ((r = inputgetrune(in)) == RUNE_EOF || r == '\n') {
 			break;
-		else
-			line[i] = c;
+		} else if (i + printwidth(r) > win->buf->width) {
+			inputungetrune(in, r);
+			break;
+		} else {
+			line[i] = r;
+		}
 
 	return 0;
 }
 
 static void
-winresize(Window *win, size_t rows, size_t cols)
+winresize(Window *win, size_t rows, size_t cols, Input *in)
 {
 	win->rows = rows;
 	bufsetwidth(win->buf, cols);
-	winfill(win);
+	winfill(win, in);
 }
 
 static void
-winscrollbot(Window *win)
+winscrollbot(Window *win, Input *in)
 {
-	while (!wingetline(win))
+	while (!wingetline(win, in))
 		;
 	win->row = win->buf->len;
 }
 
 static void
-winscrolldown(Window *win, size_t lines)
+winscrolldown(Window *win, size_t lines, Input *in)
 {
 	while (win->buf->len < win->row + lines) {
-		if (wingetline(win))
+		if (wingetline(win, in))
 			break;
 	}
 
@@ -338,6 +466,65 @@ winscrollup(Window *win, size_t lines)
 	win->row = lines > win->row ? 0 : win->row - lines;
 	if (win->row < win->rows)
 		win->row = win->rows < win->buf->len ? win->rows : win->buf->len;
+}
+
+static Input *
+inputnew(FILE *file)
+{
+	Input *in;
+
+	in = xmalloc(sizeof(*in));
+	in->file = file;
+	in->buflen = 0;
+	in->unread = RUNE_EOF;
+	return in;
+}
+
+static void
+inputfree(Input *in)
+{
+	free(in);
+}
+
+static int
+inputatend(Input *in)
+{
+	return in->buflen == 0 && in->unread == RUNE_EOF && (feof(in->file) || ferror(in->file));
+}
+
+static Rune
+inputgetrune(Input *in)
+{
+	size_t i, len;
+	int c;
+	Rune r;
+
+	if (in->unread != RUNE_EOF) {
+		r = in->unread;
+		in->unread = RUNE_EOF;
+		return r;
+	}
+
+	for (; in->buflen < LEN(in->buf); i++)
+		if ((c = fgetc(in->file)) != EOF)
+			in->buf[in->buflen++] = c;
+		else
+			break;
+
+	if (in->buflen == 0)
+		return RUNE_EOF;
+
+	len = utfdecode(in->buf, in->buflen, &r);
+	for (i = len; i < in->buflen; i++)
+		in->buf[i - len] = in->buf[i];
+	in->buflen -= len;
+	return r;
+}
+
+static void
+inputungetrune(Input *in, Rune r)
+{
+	in->unread = r;
 }
 
 static void
@@ -374,14 +561,22 @@ uigetkey(void)
 static void
 uirefresh(void)
 {
-	size_t i, j, start;
+	size_t i, j, k, start, width, rlen;
+	char buf[4];
 
 	clear();
 	start = win->row >= win->rows ? win->row - win->rows : 0;
 	for (i = start; i < win->row; i++) {
 		move(i - start, 0);
-		for (j = 0; j < win->buf->width; j++)
-			addch(win->buf->lines[i][j]);
+		width = 0;
+		for (j = 0; j < win->buf->width; j++) {
+			rlen = sprintrune(buf, win->buf->lines[i][j]);
+			if (width + rlen > win->buf->width)
+				break;
+			/* TODO: curses doesn't actually handle UTF-8 like this */
+			for (k = 0; k < rlen; k++)
+				addch(buf[k]);
+		}
 	}
 	refresh();
 }
@@ -392,7 +587,7 @@ uiresize(void)
 	int rows, cols;
 
 	getmaxyx(stdscr, rows, cols);
-	winresize(win, rows, cols);
+	winresize(win, rows, cols, input);
 	uirefresh();
 }
 
@@ -402,6 +597,7 @@ main(int argc, char **argv)
 	int key;
 	size_t i;
 
+	input = inputnew(stdin);
 	win = winnew();
 	uiinit();
 	uiresize();
@@ -424,5 +620,6 @@ main(int argc, char **argv)
 done:
 	uiteardown();
 	winfree(win);
+	inputfree(input);
 	return 0;
 }
