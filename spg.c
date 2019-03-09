@@ -413,13 +413,15 @@ wingetline(Window *win, Input *in)
 
 	line = bufnewline(win->buf);
 	for (i = 0; i < win->buf->linecap; i++)
-		if ((r = inputgetrune(in)) == RUNE_EOF || r == '\n') {
+		if ((r = inputgetrune(in)) == RUNE_EOF) {
 			break;
 		} else if (i + printwidth(r) > win->buf->width) {
 			inputungetrune(in, r);
 			break;
 		} else {
 			line[i] = r;
+			if (r == '\n')
+				break;
 		}
 
 	return 0;
@@ -570,6 +572,8 @@ uirefresh(void)
 		move(i - start, 0);
 		width = 0;
 		for (j = 0; j < win->buf->width; j++) {
+			if (win->buf->lines[i][j] == '\n')
+				continue;
 			rlen = sprintrune(buf, win->buf->lines[i][j]);
 			if (width + rlen > win->buf->width)
 				break;
