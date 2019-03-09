@@ -15,18 +15,25 @@
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <term.h>
+#include <termios.h>
+#include <unistd.h>
 
-#include <curses.h>
+/* This is coming from term.h and we don't use it */
+#undef lines
 
 #define LEN(x) (sizeof(x) / sizeof(*(x)))
 #define USED(x) ((void)(x))
 
+#define KEY_RESIZE -2
 #define RUNE_EOF -1
 #define RUNE_INVALID 0xFFFD
 
@@ -59,9 +66,13 @@ typedef struct Buffer Buffer;
 typedef struct Window Window;
 typedef struct Input Input;
 
-static SCREEN *scrn;
 static Window *win;
 static Input *input;
+static struct termios tsave;
+static struct termios tcurr;
+static int uiactive;
+static FILE *tty;
+static sig_atomic_t winch;
 
 struct Buffer {
 	Rune **lines;
@@ -116,6 +127,8 @@ static void uiteardown(void);
 static int uigetkey(void);
 static void uirefresh(void);
 static void uiresize(void);
+
+static void sigwinch(int signo);
 
 static int
 pagedown(Arg a)
@@ -359,7 +372,7 @@ bufsetwidth(Buffer *buf, size_t width)
 
 	if (width > buf->linecap) {
 		for (i = 0; i < buf->len; i++) {
-			buf->lines[i] = xrealloc(buf->lines[i], width);
+			buf->lines[i] = xrealloc(buf->lines[i], width * sizeof(**buf->lines));
 			for (j = buf->linecap; j < width; j++)
 				buf->lines[i][j] = ' ';
 		}
@@ -532,32 +545,55 @@ inputungetrune(Input *in, Rune r)
 static void
 uiinit(void)
 {
-	FILE *tty;
+	struct sigaction sa;
 
 	if (!(tty = fopen("/dev/tty", "r")))
 		die(1, "no tty");
-	if (!(scrn = newterm(NULL, stdout, tty)))
-		die(1, "cannot create screen");
-	set_term(scrn);
-	cbreak();
-	keypad(stdscr, TRUE);
-	noecho();
-	curs_set(0);
+
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sa.sa_handler = sigwinch;
+	sigaction(SIGWINCH, &sa, NULL);
+
+	tcgetattr(fileno(tty), &tsave);
+	uiactive = 1;
+	tcurr = tsave;
+	tcurr.c_lflag &= ~(ECHO | ICANON);
+	tcsetattr(fileno(tty), TCSANOW, &tcurr);
+	setupterm(NULL, 1, NULL);
+	putp(tparm(cursor_invisible, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+	fflush(stdout);
 }
 
 static void
 uiteardown(void)
 {
-	if (scrn) {
-		endwin();
-		delscreen(scrn);
+	if (uiactive) {
+		putp(tparm(cursor_normal, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+		putchar('\n'); /* Make sure the cursor ends up on a new line */
+		tcsetattr(fileno(tty), TCSANOW, &tsave);
+		fflush(stdout);
 	}
 }
 
 static int
 uigetkey(void)
 {
-	return getch();
+	int c;
+
+	errno = 0;
+	while ((c = fgetc(tty)) == EOF)
+		if (errno == EINTR) {
+			if (winch) {
+				winch = 0;
+				return KEY_RESIZE;
+			}
+		} else {
+			die(1, "could not get input key");
+		}
+
+	return c;
 }
 
 static void
@@ -566,10 +602,10 @@ uirefresh(void)
 	size_t i, j, k, start, width, rlen;
 	char buf[4];
 
-	clear();
+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 	start = win->row >= win->rows ? win->row - win->rows : 0;
 	for (i = start; i < win->row; i++) {
-		move(i - start, 0);
+		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
 		width = 0;
 		for (j = 0; j < win->buf->width; j++) {
 			if (win->buf->lines[i][j] == '\n')
@@ -577,22 +613,29 @@ uirefresh(void)
 			rlen = sprintrune(buf, win->buf->lines[i][j]);
 			if (width + rlen > win->buf->width)
 				break;
-			/* TODO: curses doesn't actually handle UTF-8 like this */
 			for (k = 0; k < rlen; k++)
-				addch(buf[k]);
+				putchar(buf[k]);
 		}
 	}
-	refresh();
+	fflush(stdout);
 }
 
 static void
 uiresize(void)
 {
-	int rows, cols;
+	struct winsize ws;
 
-	getmaxyx(stdscr, rows, cols);
-	winresize(win, rows, cols, input);
+	if (ioctl(1, TIOCGWINSZ, &ws) < 0)
+		die(1, "could not get terminal size");
+	winresize(win, ws.ws_row, ws.ws_col, input);
 	uirefresh();
+}
+
+static void
+sigwinch(int signo)
+{
+	USED(signo);
+	winch = 1;
 }
 
 int
@@ -608,7 +651,6 @@ main(int argc, char **argv)
 
 	for (;;) {
 		key = uigetkey();
-		/* TODO: this isn't portable */
 		if (key == KEY_RESIZE) {
 			uiresize();
 			continue;
