@@ -275,8 +275,7 @@ static size_t utfdecode(const char *s, size_t len, Rune *r)
 		goto done;
 	}
 
-	bytes = len;
-	for (i = 1; i < len; i++)
+	for (i = 1; i < bytes; i++)
 		if ((s[i] & 0xC0) == 0x80) {
 			got = (got << 6) | (s[i] & 0x3F);
 		} else {
@@ -308,12 +307,12 @@ static size_t utfencode(char *s, Rune r)
 		s[1] = 0x80 | (r & 0x3F);
 		return 2;
 	} else if (r <= 0xFFFF) {
-		s[0] = 0xC0 | ((r >> 12) & 0x1F);
+		s[0] = 0xE0 | ((r >> 12) & 0x0F);
 		s[1] = 0x80 | ((r >> 6) & 0x3F);
 		s[2] = 0x80 | (r & 0x3F);
 		return 3;
 	} else {
-		s[0] = 0xC0 | ((r >> 18) & 0x1F);
+		s[0] = 0xF0 | ((r >> 18) & 0x07);
 		s[1] = 0x80 | ((r >> 12) & 0x3F);
 		s[2] = 0x80 | ((r >> 6) & 0x3F);
 		s[3] = 0x80 | (r & 0x3F);
