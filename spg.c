@@ -270,6 +270,10 @@ static size_t utfdecode(const char *s, size_t len, Rune *r)
 	} else if ((s[0] & 0xE0) == 0xC0) {
 		got = s[0] & 0x1F;
 		bytes = 2;
+	} else {
+		got = RUNE_INVALID;
+		bytes = 1;
+		goto done;
 	}
 	if (bytes > len) {
 		got = RUNE_INVALID;
@@ -292,6 +296,7 @@ static size_t utfdecode(const char *s, size_t len, Rune *r)
 	}
 
 done:
+	fprintf(stderr, "bytes = %zu got = %d\n", bytes, got);
 	if (r)
 		*r = got;
 	return bytes;
@@ -328,7 +333,7 @@ bufnew(size_t width)
 	Buffer *buf;
 
 	buf = xmalloc(sizeof(*buf));
-	buf->linelen = width + 1;
+	buf->linelen = width + 2;
 	buf->len = 0;
 	buf->cap = 128;
 	buf->lines = xmalloc(buf->cap * sizeof(*buf->lines));
@@ -375,7 +380,7 @@ bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 	size_t i, j, r, c, w;
 
 	new = bufnew(width);
-	if (buf->len == 0)
+	if (!buf || buf->len == 0)
 		goto done;
 	newl = bufnewline(new);
 	r = c = j = 0;
@@ -444,21 +449,23 @@ static int
 wingetline(Window *win, Input *in)
 {
 	Rune *line;
-	size_t i;
+	size_t i, w;
 	Rune r;
 
 	if (inputatend(in))
 		return 1;
 
 	line = bufnewline(win->buf);
+	w = 0;
 	for (i = 0; i < win->buf->linelen - 1; i++)
 		if ((r = inputgetrune(in)) == RUNE_EOF) {
 			break;
-		} else if (i + printwidth(r) > win->cols) {
+		} else if (w + printwidth(r) > win->cols) {
 			inputungetrune(in, r);
 			break;
 		} else {
 			line[i] = r;
+			w += printwidth(r);
 			if (r == '\n')
 				break;
 		}
