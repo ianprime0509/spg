@@ -27,7 +27,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-/* This is coming from term.h and we don't use it */
+/* This is coming from term.h and it conflicts with one of our names */
 #undef lines
 
 #define LEN(x) (sizeof(x) / sizeof(*(x)))
@@ -76,12 +76,12 @@ static sig_atomic_t winch;
 
 struct Buffer {
 	Rune **lines;
-	size_t len, cap, width, linecap;
+	size_t len, cap, linelen;
 };
 
 struct Window {
 	Buffer *buf;
-	size_t rows, row;
+	size_t rows, cols, row;
 };
 
 struct Input {
@@ -100,13 +100,13 @@ static size_t sprintrune(char *s, Rune r);
 static size_t utfdecode(const char *s, size_t len, Rune *r);
 static size_t utfencode(char *s, Rune r);
 
-static Buffer *bufnew(void);
+static Buffer *bufnew(size_t width);
 static void buffree(Buffer *buf);
 static void bufgrow(Buffer *buf);
 static Rune *bufnewline(Buffer *buf);
-static void bufsetwidth(Buffer *buf, size_t width);
+static Buffer *bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow);
 
-static Window *winnew(void);
+static Window *winnew(size_t rows, size_t cols);
 static void winfree(Window *win);
 static void winfill(Window *win, Input *in);
 static int wingetline(Window *win, Input *in);
@@ -125,6 +125,7 @@ static void inputungetrune(Input *in, Rune r);
 static void uiinit(void);
 static void uiteardown(void);
 static int uigetkey(void);
+static void uigetsize(size_t *rows, size_t *cols);
 static void uirefresh(void);
 static void uiresize(void);
 
@@ -227,9 +228,10 @@ xrealloc(void *mem, size_t sz)
 static size_t printwidth(Rune r)
 {
 	/* TODO: implement some logic for characters that take up two cells */
-	if (r < 0x20 || r == 0x7F) {
+	if (r < 0x20 || r == 0x7F)
 		return 2;
-	}
+	else if (r == '\n')
+		return 0;
 	return 1;
 }
 
@@ -321,12 +323,13 @@ static size_t utfencode(char *s, Rune r)
 }
 
 static Buffer *
-bufnew(void)
+bufnew(size_t width)
 {
 	Buffer *buf;
 
 	buf = xmalloc(sizeof(*buf));
-	buf->len = buf->width = buf->linecap = 0;
+	buf->linelen = width + 1;
+	buf->len = 0;
 	buf->cap = 128;
 	buf->lines = xmalloc(buf->cap * sizeof(*buf->lines));
 	return buf;
@@ -358,36 +361,60 @@ bufnewline(Buffer *buf)
 
 	if (buf->len == buf->cap)
 		bufgrow(buf);
-	line = buf->lines[buf->len++] = xmalloc(buf->linecap * sizeof(**buf->lines));
-	for (i = 0; i < buf->linecap; i++)
-		line[i] = ' ';
+	line = buf->lines[buf->len++] = xmalloc(buf->linelen * sizeof(**buf->lines));
+	for (i = 0; i < buf->linelen; i++)
+		line[i] = RUNE_EOF;
 	return line;
 }
 
-static void
-bufsetwidth(Buffer *buf, size_t width)
+static Buffer *
+bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 {
-	size_t i, j;
+	Buffer *new;
+	Rune *oldl, *newl;
+	size_t i, j, r, c, w;
 
-	if (width > buf->linecap) {
-		for (i = 0; i < buf->len; i++) {
-			buf->lines[i] = xrealloc(buf->lines[i], width * sizeof(**buf->lines));
-			for (j = buf->linecap; j < width; j++)
-				buf->lines[i][j] = ' ';
+	new = bufnew(width);
+	if (buf->len == 0)
+		goto done;
+	newl = bufnewline(new);
+	r = c = j = 0;
+
+	for (i = 0; i < buf->len; i++) {
+		for (oldl = buf->lines[i]; *oldl != RUNE_EOF; oldl++) {
+			w = printwidth(*oldl);
+			if (c + w > width || j >= new->linelen - 1 || *oldl == '\n') {
+				newl = bufnewline(new);
+				r++;
+				c = j = 0;
+			}
+			*newl++ = *oldl;
+			c += w;
+			j++;
 		}
-		buf->linecap = width;
+
+		if (i == row - 1 && newrow)
+			*newrow = r + 1;
+		free(buf->lines[i]);
 	}
-	buf->width = width;
+	if (i <= row - 1 && newrow)
+		*newrow = r + 1;
+
+done:
+	free(buf->lines);
+	return new;
 }
 
 static Window *
-winnew(void)
+winnew(size_t rows, size_t cols)
 {
 	Window *win;
 
 	win = xmalloc(sizeof(*win));
-	win->buf = bufnew();
-	win->rows = win->row = 0;
+	win->buf = bufnew(cols);
+	win->rows = rows;
+	win->cols = cols;
+	win->row = 0;
 	return win;
 }
 
@@ -424,10 +451,10 @@ wingetline(Window *win, Input *in)
 		return 1;
 
 	line = bufnewline(win->buf);
-	for (i = 0; i < win->buf->linecap; i++)
+	for (i = 0; i < win->buf->linelen - 1; i++)
 		if ((r = inputgetrune(in)) == RUNE_EOF) {
 			break;
-		} else if (i + printwidth(r) > win->buf->width) {
+		} else if (i + printwidth(r) > win->cols) {
 			inputungetrune(in, r);
 			break;
 		} else {
@@ -443,7 +470,7 @@ static void
 winresize(Window *win, size_t rows, size_t cols, Input *in)
 {
 	win->rows = rows;
-	bufsetwidth(win->buf, cols);
+	win->buf = bufreflow(win->buf, cols, win->row, &win->row);
 	winfill(win, in);
 }
 
@@ -596,24 +623,35 @@ uigetkey(void)
 }
 
 static void
+uigetsize(size_t *rows, size_t *cols)
+{
+	struct winsize ws;
+
+	if (ioctl(1, TIOCGWINSZ, &ws) < 0)
+		die(1, "can't get terminal size");
+	if (rows)
+		*rows = ws.ws_row;
+	if (cols)
+		*cols = ws.ws_col;
+}
+
+static void
 uirefresh(void)
 {
-	size_t i, j, k, start, width, rlen;
+	size_t i, j, start, rlen;
+	Rune *line;
 	char buf[4];
 
 	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 	start = win->row >= win->rows ? win->row - win->rows : 0;
 	for (i = start; i < win->row; i++) {
 		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
-		width = 0;
-		for (j = 0; j < win->buf->width; j++) {
-			if (win->buf->lines[i][j] == '\n')
+		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++) {
+			if (*line == '\n')
 				continue;
-			rlen = sprintrune(buf, win->buf->lines[i][j]);
-			if (width + rlen > win->buf->width)
-				break;
-			for (k = 0; k < rlen; k++)
-				putchar(buf[k]);
+			rlen = sprintrune(buf, *line);
+			for (j = 0; j < rlen; j++)
+				putchar(buf[j]);
 		}
 	}
 	fflush(stdout);
@@ -622,11 +660,10 @@ uirefresh(void)
 static void
 uiresize(void)
 {
-	struct winsize ws;
+	size_t rows, cols;
 
-	if (ioctl(1, TIOCGWINSZ, &ws) < 0)
-		die(1, "could not get terminal size");
-	winresize(win, ws.ws_row, ws.ws_col, input);
+	uigetsize(&rows, &cols);
+	winresize(win, rows, cols, input);
 	uirefresh();
 }
 
@@ -641,10 +678,11 @@ int
 main(int argc, char **argv)
 {
 	int key;
-	size_t i;
+	size_t i, rows, cols;
 
 	input = inputnew(stdin);
-	win = winnew();
+	uigetsize(&rows, &cols);
+	win = winnew(rows, cols);
 	uiinit();
 	uiresize();
 
