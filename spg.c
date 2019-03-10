@@ -31,6 +31,7 @@
 #undef lines
 
 #define LEN(x) (sizeof(x) / sizeof(*(x)))
+#define MIN(x, y) ((x) > (y) ? (y) : (x))
 #define USED(x) ((void)(x))
 
 #define KEY_RESIZE -2
@@ -296,7 +297,6 @@ static size_t utfdecode(const char *s, size_t len, Rune *r)
 	}
 
 done:
-	fprintf(stderr, "bytes = %zu got = %d\n", bytes, got);
 	if (r)
 		*r = got;
 	return bytes;
@@ -377,35 +377,38 @@ bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 {
 	Buffer *new;
 	Rune *oldl, *newl;
-	size_t i, j, r, c, w;
+	size_t i, j, c, w;
+	int needline;
 
 	new = bufnew(width);
-	if (!buf || buf->len == 0)
-		goto done;
-	newl = bufnewline(new);
-	r = c = j = 0;
+	needline = 1;
+	c = j = 0;
 
 	for (i = 0; i < buf->len; i++) {
 		for (oldl = buf->lines[i]; *oldl != RUNE_EOF; oldl++) {
 			w = printwidth(*oldl);
-			if (c + w > width || j >= new->linelen - 1 || *oldl == '\n') {
+			if (needline || c + w > width || j >= new->linelen - 1) {
 				newl = bufnewline(new);
-				r++;
 				c = j = 0;
+				needline = 0;
 			}
-			*newl++ = *oldl;
-			c += w;
-			j++;
+			if (*oldl == '\n') {
+				*newl = *oldl;
+				needline = 1;
+			} else {
+				*newl++ = *oldl;
+				c += w;
+				j++;
+			}
 		}
 
 		if (i == row - 1 && newrow)
-			*newrow = r + 1;
+			*newrow = new->len;
 		free(buf->lines[i]);
 	}
 	if (i <= row - 1 && newrow)
-		*newrow = r + 1;
+		*newrow = new->len;
 
-done:
 	free(buf->lines);
 	return new;
 }
@@ -505,7 +508,7 @@ winscrolldown(Window *win, size_t lines, Input *in)
 static void
 winscrolltop(Window *win)
 {
-	win->row = win->buf->len > win->rows ? win->rows : win->buf->len;
+	win->row = MIN(win->rows, win->buf->len);
 }
 
 static void
@@ -513,7 +516,7 @@ winscrollup(Window *win, size_t lines)
 {
 	win->row = lines > win->row ? 0 : win->row - lines;
 	if (win->row < win->rows)
-		win->row = win->rows < win->buf->len ? win->rows : win->buf->len;
+		win->row = MIN(win->rows, win->buf->len);
 }
 
 static Input *
@@ -651,6 +654,9 @@ uirefresh(void)
 
 	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 	start = win->row >= win->rows ? win->row - win->rows : 0;
+	if (win->row < win->rows)
+		win->row = MIN(win->rows, win->buf->len);
+
 	for (i = start; i < win->row; i++) {
 		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
 		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++) {
