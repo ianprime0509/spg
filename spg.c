@@ -230,7 +230,7 @@ xrealloc(void *mem, size_t sz)
 static size_t
 nexttabstop(size_t col)
 {
-	return (col + TABWIDTH) * TABWIDTH / TABWIDTH;
+	return (col + TABWIDTH) / TABWIDTH * TABWIDTH;
 }
 
 static size_t
