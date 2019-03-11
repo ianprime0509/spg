@@ -1,3 +1,6 @@
+/* Cosmetic configuration */
+#define TABWIDTH 8
+
 /*
  * Keybindings are defined in the following format:
  * { key, function, argument }

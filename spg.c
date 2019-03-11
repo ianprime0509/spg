@@ -96,6 +96,7 @@ static void die(int status, const char *fmt, ...);
 static void *xmalloc(size_t sz);
 static void *xrealloc(void *mem, size_t sz);
 
+static size_t nexttabstop(size_t col);
 static size_t printwidth(Rune r);
 static size_t sprintrune(char *s, Rune r);
 static size_t utfdecode(const char *s, size_t len, Rune *r);
@@ -226,17 +227,25 @@ xrealloc(void *mem, size_t sz)
 	return newmem;
 }
 
-static size_t printwidth(Rune r)
+static size_t
+nexttabstop(size_t col)
+{
+	return (col + TABWIDTH) * TABWIDTH / TABWIDTH;
+}
+
+static size_t
+printwidth(Rune r)
 {
 	/* TODO: implement some logic for characters that take up two cells */
 	if (r < 0x20 || r == 0x7F)
 		return 2;
-	else if (r == '\n')
-		return 0;
+	else if (r == '\n' || r == '\t')
+		return 0; /* These characters require special handling */
 	return 1;
 }
 
-static size_t sprintrune(char *s, Rune r)
+static size_t
+sprintrune(char *s, Rune r)
 {
 	if (r < 0x20 || r == 0x7F) {
 		s[0] = '^';
@@ -246,7 +255,8 @@ static size_t sprintrune(char *s, Rune r)
 	return utfencode(s, r);
 }
 
-static size_t utfdecode(const char *s, size_t len, Rune *r)
+static size_t
+utfdecode(const char *s, size_t len, Rune *r)
 {
 	Rune got;
 	size_t bytes, i;
@@ -302,7 +312,8 @@ done:
 	return bytes;
 }
 
-static size_t utfencode(char *s, Rune r)
+static size_t
+utfencode(char *s, Rune r)
 {
 	if (r < 0 || r > 0x10FFFF) {
 		return 0;
@@ -392,14 +403,15 @@ bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 				c = j = 0;
 				needline = 0;
 			}
-			if (*oldl == '\n') {
-				*newl = *oldl;
+
+			*newl++ = *oldl;
+			j++;
+			if (*oldl == '\n')
 				needline = 1;
-			} else {
-				*newl++ = *oldl;
+			else if (*oldl == '\t')
+				c = nexttabstop(c);
+			else
 				c += w;
-				j++;
-			}
 		}
 
 		if (i == row - 1 && newrow)
@@ -648,7 +660,7 @@ uigetsize(size_t *rows, size_t *cols)
 static void
 uirefresh(void)
 {
-	size_t i, j, start, rlen;
+	size_t i, j, col, start, rlen;
 	Rune *line;
 	char buf[4];
 
@@ -659,12 +671,19 @@ uirefresh(void)
 
 	for (i = start; i < win->row; i++) {
 		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
+		col = 0;
 		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++) {
-			if (*line == '\n')
-				continue;
-			rlen = sprintrune(buf, *line);
-			for (j = 0; j < rlen; j++)
-				putchar(buf[j]);
+			if (*line == '\t') {
+				rlen = nexttabstop(col) - col;
+				for (j = 0; j < rlen; j++)
+					putchar(' ');
+				col = nexttabstop(col);
+			} else if (*line != '\n') {
+				rlen = sprintrune(buf, *line);
+				for (j = 0; j < rlen; j++)
+					putchar(buf[j]);
+				col += printwidth(*line);
+			}
 		}
 	}
 	fflush(stdout);
