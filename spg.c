@@ -72,7 +72,6 @@ static Window *win;
 static Input *input;
 static struct termios tsave;
 static struct termios tcurr;
-static int uiactive;
 static FILE *tty;
 static sig_atomic_t winch;
 
@@ -133,6 +132,7 @@ static size_t uiprint(Rune r, size_t col);
 static void uirefresh(void);
 static void uiresize(void);
 
+static void sigterm(int signo);
 static void sigwinch(int signo);
 
 static int
@@ -197,7 +197,6 @@ die(int status, const char *fmt, ...)
 {
 	va_list args;
 
-	uiteardown();
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);
 	va_end(args);
@@ -548,6 +547,7 @@ inputnew(FILE *file)
 static void
 inputfree(Input *in)
 {
+	fclose(in->file);
 	free(in);
 }
 
@@ -604,9 +604,13 @@ uiinit(void)
 	sa.sa_flags = 0;
 	sa.sa_handler = sigwinch;
 	sigaction(SIGWINCH, &sa, NULL);
+	sa.sa_handler = sigterm;
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
 
 	tcgetattr(fileno(tty), &tsave);
-	uiactive = 1;
+	atexit(uiteardown);
 	tcurr = tsave;
 	tcurr.c_lflag &= ~(ECHO | ICANON);
 	tcsetattr(fileno(tty), TCSANOW, &tcurr);
@@ -619,12 +623,10 @@ uiinit(void)
 static void
 uiteardown(void)
 {
-	if (uiactive) {
-		putp(tparm(cursor_normal, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-		putchar('\n'); /* Make sure the cursor ends up on a new line */
-		tcsetattr(fileno(tty), TCSANOW, &tsave);
-		fflush(stdout);
-	}
+	putp(tparm(cursor_normal, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+	putchar('\n'); /* Make sure the cursor ends up on a new line */
+	tcsetattr(fileno(tty), TCSANOW, &tsave);
+	fflush(stdout);
 }
 
 static int
@@ -715,6 +717,13 @@ uiresize(void)
 }
 
 static void
+sigterm(int signo)
+{
+	USED(signo);
+	exit(1);
+}
+
+static void
 sigwinch(int signo)
 {
 	USED(signo);
@@ -726,11 +735,21 @@ main(int argc, char **argv)
 {
 	int key;
 	size_t i, rows, cols;
+	FILE *file;
 
-	input = inputnew(stdin);
+	if (argc == 1) {
+		file = stdin;
+	} else if (argc == 2) {
+		if (!(file = fopen(argv[1], "r")))
+			die(1, "cannot open '%s'", argv[1]);
+	} else {
+		die(2, "usage: spg [file]");
+	}
+
+	uiinit();
+	input = inputnew(file);
 	uigetsize(&rows, &cols);
 	win = winnew(rows, cols);
-	uiinit();
 	uiresize();
 
 	for (;;) {
@@ -748,7 +767,6 @@ main(int argc, char **argv)
 	}
 
 done:
-	uiteardown();
 	winfree(win);
 	inputfree(input);
 	return 0;
