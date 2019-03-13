@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -128,6 +129,7 @@ static void uiinit(void);
 static void uiteardown(void);
 static int uigetkey(void);
 static void uigetsize(size_t *rows, size_t *cols);
+static size_t uiprint(Rune r, size_t col);
 static void uirefresh(void);
 static void uiresize(void);
 
@@ -237,7 +239,7 @@ static size_t
 printwidth(Rune r)
 {
 	/* TODO: implement some logic for characters that take up two cells */
-	if (r < 0x20 || r == 0x7F)
+	if (iscntrl(r))
 		return 2;
 	else if (r == '\n' || r == '\t')
 		return 0; /* These characters require special handling */
@@ -247,7 +249,7 @@ printwidth(Rune r)
 static size_t
 sprintrune(char *s, Rune r)
 {
-	if (r < 0x20 || r == 0x7F) {
+	if (iscntrl(r)) {
 		s[0] = '^';
 		s[1] = r ^ 0x40;
 		return 2;
@@ -657,12 +659,36 @@ uigetsize(size_t *rows, size_t *cols)
 		*cols = ws.ws_col;
 }
 
+static size_t
+uiprint(Rune r, size_t col)
+{
+	size_t i, rlen;
+	char buf[4];
+
+	if (r == '\n') {
+		return col;
+	} else if (r == '\t') {
+		rlen = nexttabstop(col) - col;
+		for (i = 0; i < rlen; i++)
+			putchar(' ');
+		return nexttabstop(col);
+	}
+
+	if (iscntrl(r))
+		putp(tparm(enter_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+	rlen = sprintrune(buf, r);
+	for (i = 0; i < rlen; i++)
+		putchar(buf[i]);
+	if (iscntrl(r))
+		putp(tparm(exit_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+	return col + printwidth(r);
+}
+
 static void
 uirefresh(void)
 {
-	size_t i, j, col, start, rlen;
+	size_t i, col, start;
 	Rune *line;
-	char buf[4];
 
 	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));
 	start = win->row >= win->rows ? win->row - win->rows : 0;
@@ -672,19 +698,8 @@ uirefresh(void)
 	for (i = start; i < win->row; i++) {
 		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
 		col = 0;
-		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++) {
-			if (*line == '\t') {
-				rlen = nexttabstop(col) - col;
-				for (j = 0; j < rlen; j++)
-					putchar(' ');
-				col = nexttabstop(col);
-			} else if (*line != '\n') {
-				rlen = sprintrune(buf, *line);
-				for (j = 0; j < rlen; j++)
-					putchar(buf[j]);
-				col += printwidth(*line);
-			}
-		}
+		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++)
+			col = uiprint(*line, col);
 	}
 	fflush(stdout);
 }
