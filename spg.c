@@ -48,12 +48,19 @@ enum {
 	RUNE_INVALID = 0xFFFD,
 };
 
+enum Direction {
+	FORWARDS,
+	BACKWARDS,
+};
+
 typedef union Arg Arg;
 typedef struct Key Key;
+typedef enum Direction Direction;
 
 union Arg {
 	size_t zu;
 	double lf;
+	enum Direction dir;
 };
 
 struct Key {
@@ -110,6 +117,7 @@ struct Prompt {
 	char buf[4];
 	size_t len, cap, buflen, col;
 	int active;
+	Rune prompt;
 };
 
 static void die(int status, const char *fmt, ...);
@@ -145,7 +153,7 @@ static int inputatend(Input *in);
 static Rune inputgetrune(Input *in);
 static void inputungetrune(Input *in, Rune r);
 
-static Prompt *promptnew(void);
+static Prompt *promptnew(Rune prompt);
 static void promptfree(Prompt *p);
 static Rune promptputchar(Prompt *p, char c);
 
@@ -155,7 +163,7 @@ static int uigetkey(void);
 static void uigetsize(size_t *rows, size_t *cols);
 static size_t uiprint(Rune r, size_t col);
 static void uipromptkey(Prompt *p, char key);
-static void uipromptsearch(void);
+static void uipromptopen(Prompt *p);
 static void uirefresh(void);
 static void uiresize(void);
 
@@ -181,8 +189,12 @@ pageup(Arg a)
 static int
 promptsearch(Arg a)
 {
-	USED(a);
-	uipromptsearch();
+	if (a.dir == FORWARDS) {
+		search->prompt = '/';
+	} else if (a.dir == BACKWARDS) {
+		search->prompt = '?';
+	}
+	uipromptopen(search);
 	return 0;
 }
 
@@ -640,7 +652,7 @@ inputungetrune(Input *in, Rune r)
 }
 
 static Prompt *
-promptnew(void)
+promptnew(Rune prompt)
 {
 	Prompt *p;
 
@@ -649,6 +661,7 @@ promptnew(void)
 	p->cap = 128;
 	p->text = xmalloc(p->cap * sizeof(*p->text));
 	p->active = 0;
+	p->prompt = prompt;
 	return p;
 }
 
@@ -814,14 +827,13 @@ uipromptkey(Prompt *p, char key)
 }
 
 static void
-uipromptsearch(void)
+uipromptopen(Prompt *p)
 {
-	search->len = 0;
+	p->len = 0;
 	putp(tparm(cursor_address, win->rows - 1, 0, 0, 0, 0, 0, 0, 0, 0));
-	putchar('/');
-	search->col = 1;
+	p->col = uiprint(p->prompt, 0);
 	fflush(stdout);
-	search->active = 1;
+	p->active = 1;
 }
 
 static void
@@ -889,7 +901,7 @@ main(int argc, char **argv)
 	input = inputnew(file);
 	uigetsize(&rows, &cols);
 	win = winnew(rows, cols);
-	search = promptnew();
+	search = promptnew('/');
 	uiresize();
 
 	for (;;) {
