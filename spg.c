@@ -698,8 +698,9 @@ uirefresh(void)
 		win->row = MIN(win->rows, win->buf->len);
 
 	for (i = start; i < win->row; i++) {
-		putp(tparm(cursor_address, i - start, 0, 0, 0, 0, 0, 0, 0, 0));
 		col = 0;
+		if (i != start)
+			printf("\r\n");
 		for (line = win->buf->lines[i]; *line != RUNE_EOF; line++)
 			col = uiprint(*line, col);
 	}
