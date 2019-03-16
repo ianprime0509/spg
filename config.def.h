@@ -26,5 +26,6 @@ static Key keys[] = {
 	{ 'u', pageup, { .lf = 0.5 } },
 	{ 'f', pagedown, { .lf = 1.0 } },
 	{ 'b', pageup, { .lf = 1.0 } },
+	{ '/', promptsearch, { 0 } },
 	{ 'q', quit, { 0 } },
 };

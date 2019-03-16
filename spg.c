@@ -35,9 +35,18 @@
 #define MIN(x, y) ((x) > (y) ? (y) : (x))
 #define USED(x) ((void)(x))
 
-#define KEY_RESIZE -2
-#define RUNE_EOF -1
-#define RUNE_INVALID 0xFFFD
+enum {
+	KEY_BACKSPACE = '\x7F',
+	KEY_ESCAPE = '\x1B',
+	KEY_RESIZE = -2,
+	KEY_RETURN = '\n',
+};
+
+enum {
+	RUNE_EOF = -1,
+	RUNE_INCOMPLETE = -2,
+	RUNE_INVALID = 0xFFFD,
+};
 
 typedef union Arg Arg;
 typedef struct Key Key;
@@ -55,6 +64,7 @@ struct Key {
 
 static int pagedown(Arg a);
 static int pageup(Arg a);
+static int promptsearch(Arg a);
 static int scrollbot(Arg a);
 static int scrolldown(Arg a);
 static int scrolltop(Arg a);
@@ -67,9 +77,12 @@ typedef int_fast32_t Rune;
 typedef struct Buffer Buffer;
 typedef struct Window Window;
 typedef struct Input Input;
+typedef struct Prompt Prompt;
 
 static Window *win;
 static Input *input;
+static Prompt *search;
+
 static struct termios tsave;
 static struct termios tcurr;
 static FILE *tty;
@@ -92,6 +105,13 @@ struct Input {
 	Rune unread;
 };
 
+struct Prompt {
+	Rune *text;
+	char buf[4];
+	size_t len, cap, buflen, col;
+	int active;
+};
+
 static void die(int status, const char *fmt, ...);
 static void *xmalloc(size_t sz);
 static void *xrealloc(void *mem, size_t sz);
@@ -101,6 +121,7 @@ static size_t printwidth(Rune r);
 static size_t sprintrune(char *s, Rune r);
 static size_t utfdecode(const char *s, size_t len, Rune *r);
 static size_t utfencode(char *s, Rune r);
+static size_t utfpeeklen(char c);
 
 static Buffer *bufnew(size_t width);
 static void buffree(Buffer *buf);
@@ -124,11 +145,17 @@ static int inputatend(Input *in);
 static Rune inputgetrune(Input *in);
 static void inputungetrune(Input *in, Rune r);
 
+static Prompt *promptnew(void);
+static void promptfree(Prompt *p);
+static Rune promptputchar(Prompt *p, char c);
+
 static void uiinit(void);
 static void uiteardown(void);
 static int uigetkey(void);
 static void uigetsize(size_t *rows, size_t *cols);
 static size_t uiprint(Rune r, size_t col);
+static void uipromptkey(Prompt *p, char key);
+static void uipromptsearch(void);
 static void uirefresh(void);
 static void uiresize(void);
 
@@ -148,6 +175,14 @@ pageup(Arg a)
 {
 	winscrollup(win, a.lf > 0 ? a.lf * win->rows : 1);
 	uirefresh();
+	return 0;
+}
+
+static int
+promptsearch(Arg a)
+{
+	USED(a);
+	uipromptsearch();
 	return 0;
 }
 
@@ -337,6 +372,18 @@ utfencode(char *s, Rune r)
 		s[3] = 0x80 | (r & 0x3F);
 		return 4;
 	}
+}
+
+static size_t
+utfpeeklen(char c)
+{
+	if ((c & 0xF8) == 0xF0)
+		return 4;
+	else if ((c & 0xF0) == 0xE0)
+		return 3;
+	else if ((c & 0xE0) == 0xC0)
+		return 2;
+	return 1;
 }
 
 static Buffer *
@@ -592,6 +639,51 @@ inputungetrune(Input *in, Rune r)
 	in->unread = r;
 }
 
+static Prompt *
+promptnew(void)
+{
+	Prompt *p;
+
+	p = xmalloc(sizeof(*p));
+	p->len = p->buflen = p->col = 0;
+	p->cap = 128;
+	p->text = xmalloc(p->cap * sizeof(*p->text));
+	p->active = 0;
+	return p;
+}
+
+static void
+promptfree(Prompt *p)
+{
+	free(p->text);
+	free(p);
+}
+
+static Rune
+promptputchar(Prompt *p, char c)
+{
+	size_t rlen, i;
+	Rune r;
+
+	p->buf[p->buflen++] = c;
+	rlen = utfpeeklen(p->buf[0]);
+	if (rlen >= p->buflen) {
+		rlen = utfdecode(p->buf, p->buflen, &r);
+		for (i = rlen; i < p->buflen; i++)
+			p->buf[i - rlen] = p->buf[i];
+		p->buflen -= rlen;
+
+		if (p->len == p->cap) {
+			p->cap *= 2;
+			p->text = xrealloc(p->text, p->cap * sizeof(*p->text));
+		}
+		p->text[p->len++] = r;
+		return r;
+	}
+
+	return RUNE_INCOMPLETE;
+}
+
 static void
 uiinit(void)
 {
@@ -664,16 +756,18 @@ uigetsize(size_t *rows, size_t *cols)
 static size_t
 uiprint(Rune r, size_t col)
 {
-	size_t i, rlen;
+	size_t i, rlen, w;
 	char buf[4];
 
 	if (r == '\n') {
 		return col;
 	} else if (r == '\t') {
-		rlen = nexttabstop(col) - col;
-		for (i = 0; i < rlen; i++)
+		w = nexttabstop(col) - col;
+		if (col + w >= win->cols)
+			w = win->cols - col - 1;
+		for (i = 0; i < w; i++)
 			putchar(' ');
-		return nexttabstop(col);
+		return col + w;
 	}
 
 	if (iscntrl(r))
@@ -683,7 +777,51 @@ uiprint(Rune r, size_t col)
 		putchar(buf[i]);
 	if (iscntrl(r))
 		putp(tparm(exit_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-	return col + printwidth(r);
+
+	w = printwidth(r);
+	if (col + w > win->cols)
+		col = 0;
+	col += w;
+	return col + w >= win->cols ? 0 : col;
+}
+
+static void
+uipromptkey(Prompt *p, char key)
+{
+	Rune r;
+
+	if (key == KEY_RETURN) {
+		/* TODO: action */
+		p->active = 0;
+		uirefresh();
+	} else if (key == KEY_ESCAPE) {
+		p->len = p->col = 0;
+		p->active = 0;
+		uirefresh();
+	} else if (key == KEY_BACKSPACE) {
+		if (p->len > 0) {
+			p->col -= printwidth(--p->len);
+			printf("\b \b");
+			fflush(stdout);
+		}
+	} else {
+		r = promptputchar(p, key);
+		if (r != RUNE_INCOMPLETE) {
+			p->col = uiprint(r, p->col);
+			fflush(stdout);
+		}
+	}
+}
+
+static void
+uipromptsearch(void)
+{
+	search->len = 0;
+	putp(tparm(cursor_address, win->rows - 1, 0, 0, 0, 0, 0, 0, 0, 0));
+	putchar('/');
+	search->col = 1;
+	fflush(stdout);
+	search->active = 1;
 }
 
 static void
@@ -751,6 +889,7 @@ main(int argc, char **argv)
 	input = inputnew(file);
 	uigetsize(&rows, &cols);
 	win = winnew(rows, cols);
+	search = promptnew();
 	uiresize();
 
 	for (;;) {
@@ -759,6 +898,12 @@ main(int argc, char **argv)
 			uiresize();
 			continue;
 		}
+
+		if (search->active) {
+			uipromptkey(search, key);
+			continue;
+		}
+
 		for (i = 0; i < LEN(keys); i++)
 			if (keys[i].key == key) {
 				if (keys[i].func(keys[i].arg))
@@ -768,6 +913,7 @@ main(int argc, char **argv)
 	}
 
 done:
+	promptfree(search);
 	winfree(win);
 	inputfree(input);
 	return 0;
