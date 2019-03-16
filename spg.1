@@ -1,0 +1,18 @@
+.Dd March 15, 2019
+.Dt SPG 1
+.Os
+.Sh NAME
+.Nm spg
+.Nd simple text pager
+.Sh SYNOPSIS
+.Nm
+.Op Ar file
+.Sh DESCRIPTION
+.Nm
+is a simple text pager, for reading large amounts of terminal output
+in chunks.
+It supports only the most basic functionality expected of a pager,
+namely, paging backwards and forwards through the output.
+By default, it gets its output from standard input; if
+.Ar file
+is provided, then it reads from that file instead.
