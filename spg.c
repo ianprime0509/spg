@@ -76,6 +76,8 @@ static int scrollbot(Arg a);
 static int scrolldown(Arg a);
 static int scrolltop(Arg a);
 static int scrollup(Arg a);
+static int searchbackwards(Arg a);
+static int searchforwards(Arg a);
 static int quit(Arg a);
 
 #include "config.h"
@@ -97,7 +99,7 @@ static sig_atomic_t winch;
 
 struct Buffer {
 	Rune **lines;
-	size_t len, cap, linelen;
+	size_t len, cap, linecap;
 };
 
 struct Window {
@@ -118,12 +120,14 @@ struct Prompt {
 	size_t len, cap, buflen, col;
 	int active;
 	Rune prompt;
+	int (*action)(Arg);
 };
 
 static void die(int status, const char *fmt, ...);
 static void *xmalloc(size_t sz);
 static void *xrealloc(void *mem, size_t sz);
 
+static size_t linelen(const Rune *r);
 static size_t nexttabstop(size_t col);
 static size_t printwidth(Rune r);
 static size_t sprintrune(char *s, Rune r);
@@ -134,8 +138,11 @@ static size_t utfpeeklen(char c);
 static Buffer *bufnew(size_t width);
 static void buffree(Buffer *buf);
 static void bufgrow(Buffer *buf);
+static int buflookingat(Buffer *buf, const Rune *s, size_t len, size_t row, size_t col);
 static Rune *bufnewline(Buffer *buf);
 static Buffer *bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow);
+static int bufsearchbackwards(Buffer *buf, const Rune *s, size_t len, size_t row, size_t *found);
+static int bufsearchforwards(Buffer *buf, const Rune *s, size_t len, size_t row, size_t *found);
 
 static Window *winnew(size_t rows, size_t cols);
 static void winfree(Window *win);
@@ -146,6 +153,8 @@ static void winscrollbot(Window *win, Input *in);
 static void winscrolldown(Window *win, size_t lines, Input *in);
 static void winscrolltop(Window *win);
 static void winscrollup(Window *win, size_t lines);
+static void winsearchbackwards(Window *win, const Rune *s, size_t len);
+static void winsearchforwards(Window *win, const Rune *s, size_t len, Input *in);
 
 static Input *inputnew(FILE *file);
 static void inputfree(Input *in);
@@ -153,7 +162,7 @@ static int inputatend(Input *in);
 static Rune inputgetrune(Input *in);
 static void inputungetrune(Input *in, Rune r);
 
-static Prompt *promptnew(Rune prompt);
+static Prompt *promptnew(Rune prompt, int (*action)(Arg));
 static void promptfree(Prompt *p);
 static Rune promptputchar(Prompt *p, char c);
 
@@ -191,8 +200,10 @@ promptsearch(Arg a)
 {
 	if (a.dir == FORWARDS) {
 		search->prompt = '/';
-	} else if (a.dir == BACKWARDS) {
+		search->action = searchforwards;
+	} else {
 		search->prompt = '?';
+		search->action = searchbackwards;
 	}
 	uipromptopen(search);
 	return 0;
@@ -228,6 +239,24 @@ static int
 scrollup(Arg a)
 {
 	winscrollup(win, a.zu);
+	uirefresh();
+	return 0;
+}
+
+static int
+searchbackwards(Arg a)
+{
+	USED(a);
+	winsearchbackwards(win, search->text, search->len);
+	uirefresh();
+	return 0;
+}
+
+static int
+searchforwards(Arg a)
+{
+	USED(a);
+	winsearchforwards(win, search->text, search->len, input);
 	uirefresh();
 	return 0;
 }
@@ -273,6 +302,17 @@ xrealloc(void *mem, size_t sz)
 	if (!(newmem = realloc(mem, sz)))
 		die(1, "realloc");
 	return newmem;
+}
+
+static size_t
+linelen(const Rune *line)
+{
+	size_t len;
+
+	len = 0;
+	while (*line++ != RUNE_EOF)
+		len++;
+	return len;
 }
 
 static size_t
@@ -404,7 +444,7 @@ bufnew(size_t width)
 	Buffer *buf;
 
 	buf = xmalloc(sizeof(*buf));
-	buf->linelen = width + 2;
+	buf->linecap = width + 2;
 	buf->len = 0;
 	buf->cap = 128;
 	buf->lines = xmalloc(buf->cap * sizeof(*buf->lines));
@@ -429,6 +469,25 @@ bufgrow(Buffer *buf)
 	buf->lines = xrealloc(buf->lines, buf->cap * sizeof(*buf->lines));
 }
 
+static int
+buflookingat(Buffer *buf, const Rune *s, size_t len, size_t row, size_t col)
+{
+	if (row >= buf->len || col >= buf->linecap)
+		return 0;
+
+	while (len-- > 0) {
+		if (buf->lines[row][col] != *s++)
+			return 0;
+		col++;
+		if (buf->lines[row][col] == RUNE_EOF) {
+			col = 0;
+			if (++row >= buf->len)
+				return 0;
+		}
+	}
+	return 1;
+}
+
 static Rune *
 bufnewline(Buffer *buf)
 {
@@ -437,8 +496,8 @@ bufnewline(Buffer *buf)
 
 	if (buf->len == buf->cap)
 		bufgrow(buf);
-	line = buf->lines[buf->len++] = xmalloc(buf->linelen * sizeof(**buf->lines));
-	for (i = 0; i < buf->linelen; i++)
+	line = buf->lines[buf->len++] = xmalloc(buf->linecap * sizeof(**buf->lines));
+	for (i = 0; i < buf->linecap; i++)
 		line[i] = RUNE_EOF;
 	return line;
 }
@@ -458,7 +517,7 @@ bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 	for (i = 0; i < buf->len; i++) {
 		for (oldl = buf->lines[i]; *oldl != RUNE_EOF; oldl++) {
 			w = printwidth(*oldl);
-			if (needline || c + w > width || j >= new->linelen - 1) {
+			if (needline || c + w > width || j >= new->linecap - 1) {
 				newl = bufnewline(new);
 				c = j = 0;
 				needline = 0;
@@ -483,6 +542,61 @@ bufreflow(Buffer *buf, size_t width, size_t row, size_t *newrow)
 
 	free(buf->lines);
 	return new;
+}
+
+static int
+bufsearchbackwards(Buffer *buf, const Rune *s, size_t len, size_t row, size_t *found)
+{
+	size_t i, j;
+
+	if (len == 0 || buf->len == 0 || row == 0)
+		return 1;
+
+	if (row >= buf->len - 1)
+		row = buf->len - 1;
+
+	i = row - 1;
+	j = linelen(buf->lines[i]);
+
+	for (;;) {
+		if (buf->lines[i][j] == s[0] && buflookingat(buf, s, len, i, j)) {
+			if (found)
+				*found = i;
+			return 0;
+		}
+
+		if (j-- == 0) {
+			if (i-- == 0)
+				return 1;
+			j = linelen(buf->lines[i]);
+		}
+	}
+}
+
+static int
+bufsearchforwards(Buffer *buf, const Rune *s, size_t len, size_t row, size_t *found)
+{
+	size_t i, j;
+
+	if (len == 0 || row + 1 >= buf->len)
+		return 1;
+
+	i = row + 1;
+	j = 0;
+
+	for (;;) {
+		if (buf->lines[i][j] == s[0] && buflookingat(buf, s, len, i, j)) {
+			if (found)
+				*found = i;
+			return 0;
+		}
+
+		if (buf->lines[i][++j] == RUNE_EOF) {
+			if (++i == buf->len)
+				return 1;
+			j = 0;
+		}
+	}
 }
 
 static Window *
@@ -532,7 +646,7 @@ wingetline(Window *win, Input *in)
 
 	line = bufnewline(win->buf);
 	w = 0;
-	for (i = 0; i < win->buf->linelen - 1; i++)
+	for (i = 0; i < win->buf->linecap - 1; i++)
 		if ((r = inputgetrune(in)) == RUNE_EOF) {
 			break;
 		} else if (w + printwidth(r) > win->cols) {
@@ -589,6 +703,37 @@ winscrollup(Window *win, size_t lines)
 	win->row = lines > win->row ? 0 : win->row - lines;
 	if (win->row < win->rows)
 		win->row = MIN(win->rows, win->buf->len);
+}
+
+static void
+winsearchbackwards(Window *win, const Rune *s, size_t len)
+{
+	size_t row;
+
+	if (win->row == 0 || win->buf->len == 0 || win->row <= win->rows)
+		return;
+
+	row = win->row - win->rows;
+	if (bufsearchbackwards(win->buf, s, len, row, &row))
+		return;
+	win->row = MIN(row + win->rows, win->buf->len);
+}
+
+static void
+winsearchforwards(Window *win, const Rune *s, size_t len, Input *in)
+{
+	size_t row;
+
+	if (win->row == 0 || win->buf->len == 0)
+		return;
+	row = win->row - 1;
+
+	while (bufsearchforwards(win->buf, s, len, row, &row)) {
+		row = win->buf->len - 1;
+		if (wingetline(win, in))
+			return;
+	}
+	win->row = row + 1;
 }
 
 static Input *
@@ -652,7 +797,7 @@ inputungetrune(Input *in, Rune r)
 }
 
 static Prompt *
-promptnew(Rune prompt)
+promptnew(Rune prompt, int (*action)(Arg))
 {
 	Prompt *p;
 
@@ -662,6 +807,7 @@ promptnew(Rune prompt)
 	p->text = xmalloc(p->cap * sizeof(*p->text));
 	p->active = 0;
 	p->prompt = prompt;
+	p->action = action;
 	return p;
 }
 
@@ -804,9 +950,8 @@ uipromptkey(Prompt *p, char key)
 	Rune r;
 
 	if (key == KEY_RETURN) {
-		/* TODO: action */
 		p->active = 0;
-		uirefresh();
+		p->action((Arg){ 0 });
 	} else if (key == KEY_ESCAPE) {
 		p->len = p->col = 0;
 		p->active = 0;
@@ -901,7 +1046,7 @@ main(int argc, char **argv)
 	input = inputnew(file);
 	uigetsize(&rows, &cols);
 	win = winnew(rows, cols);
-	search = promptnew('/');
+	search = promptnew('/', searchforwards);
 	uiresize();
 
 	for (;;) {

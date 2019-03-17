@@ -18,6 +18,8 @@
  * scrollup(zu) - scroll up by zu lines
  * scrolltop() - scroll to the top of the document
  * scrollbot() - scroll to the bottom of the document
+ * searchbackwards() - find the previous occurrence of the search string
+ * searchforwards() - find the next occurrence of the search string
  * quit() - exit spg
  */
 static Key keys[] = {
@@ -31,5 +33,7 @@ static Key keys[] = {
 	{ 'b', pageup, { .lf = 1.0 } },
 	{ '/', promptsearch, { .dir = FORWARDS } },
 	{ '?', promptsearch, { .dir = BACKWARDS } },
+	{ 'n', searchforwards, { 0 } },
+	{ 'N', searchbackwards, { 0 } },
 	{ 'q', quit, { 0 } },
 };

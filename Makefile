@@ -11,7 +11,7 @@ all: spg
 clean:
 	rm -f $(OBJS) spg
 
-install: spg
+install: spg spg.1
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	cp -f spg $(DESTDIR)$(PREFIX)/bin
 	chmod 555 $(DESTDIR)$(PREFIX)/bin/spg
