@@ -273,6 +273,7 @@ die(int status, const char *fmt, ...)
 {
 	va_list args;
 
+	fprintf(stderr, "spg: ");
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);
 	va_end(args);
@@ -1042,6 +1043,8 @@ main(int argc, char **argv)
 		die(2, "usage: spg [file]");
 	}
 
+	if (isatty(fileno(file)))
+		die(1, "input is a tty; provide input via file argument or pipe");
 	uiinit();
 	input = inputnew(file);
 	uigetsize(&rows, &cols);
