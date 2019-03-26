@@ -655,7 +655,10 @@ wingetline(Window *win, Input *in)
 			break;
 		} else {
 			line[i] = r;
-			w += printwidth(r);
+			if (r == '\t')
+				w = nexttabstop(w);
+			else
+				w += printwidth(r);
 			if (r == '\n')
 				break;
 		}
@@ -941,8 +944,7 @@ uiprint(Rune r, size_t col)
 	w = printwidth(r);
 	if (col + w > win->cols)
 		col = 0;
-	col += w;
-	return col + w >= win->cols ? 0 : col;
+	return col + w;
 }
 
 static void
